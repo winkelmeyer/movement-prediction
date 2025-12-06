@@ -37,17 +37,31 @@ interface HandsConstructor {
 	new (config?: HandsConfig): HandsInterface;
 }
 
+interface DangerZone {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+}
+
 export default function WebcamStream() {
 	const videoRef = useRef<HTMLVideoElement>(null);
 	const canvasRef = useRef<HTMLCanvasElement>(null);
 	const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
 	const [isStreaming, setIsStreaming] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	const [dangerZone, setDangerZone] = useState<DangerZone | null>(null);
+	const [isDefiningZone, setIsDefiningZone] = useState(false);
+	const [trackedItemName, setTrackedItemName] = useState<string>("");
+	const [handInDangerZone, setHandInDangerZone] = useState(false);
 	const streamRef = useRef<MediaStream | null>(null);
 	const intervalRef = useRef<NodeJS.Timeout | null>(null);
 	const handsRef = useRef<HandsInterface | null>(null);
 	const animationFrameRef = useRef<number | null>(null);
 	const HandsClassRef = useRef<HandsConstructor | null>(null);
+	const dragStartRef = useRef<{ x: number; y: number } | null>(null);
+	const isDraggingRef = useRef(false);
+	const dangerZoneRef = useRef<DangerZone | null>(null);
 
 	useEffect(() => {
 		return () => {
@@ -69,6 +83,32 @@ export default function WebcamStream() {
 		};
 	}, []);
 
+	// Update danger zone ref when state changes
+	useEffect(() => {
+		dangerZoneRef.current = dangerZone;
+	}, [dangerZone]);
+
+	// Check if hand bounding box intersects with danger zone
+	const checkHandInDangerZone = (
+		handMinX: number,
+		handMinY: number,
+		handMaxX: number,
+		handMaxY: number,
+	): boolean => {
+		const zone = dangerZoneRef.current;
+		if (!zone) return false;
+
+		// Check if hand bounding box overlaps with danger zone
+		const overlaps = !(
+			handMaxX < zone.x ||
+			handMinX > zone.x + zone.width ||
+			handMaxY < zone.y ||
+			handMinY > zone.y + zone.height
+		);
+
+		return overlaps;
+	};
+
 	const drawHandBoundingBoxes = (results: HandResults) => {
 		if (!overlayCanvasRef.current || !videoRef.current) return;
 
@@ -79,10 +119,26 @@ export default function WebcamStream() {
 		// Clear previous drawings
 		ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-		if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-			ctx.strokeStyle = "#00ff00"; // Green color
+		// Draw danger zone if defined
+		const zone = dangerZoneRef.current;
+		if (zone) {
+			ctx.fillStyle = "rgba(255, 0, 0, 0.2)"; // Semi-transparent red
+			ctx.fillRect(zone.x, zone.y, zone.width, zone.height);
+			ctx.strokeStyle = "#ff0000"; // Red border
 			ctx.lineWidth = 3;
+			ctx.strokeRect(zone.x, zone.y, zone.width, zone.height);
 
+			// Draw label for danger zone
+			if (trackedItemName) {
+				ctx.fillStyle = "#ffffff";
+				ctx.font = "bold 16px Arial";
+				ctx.fillText(`Danger Zone: ${trackedItemName}`, zone.x + 5, zone.y - 5);
+			}
+		}
+
+		let anyHandInZone = false;
+
+		if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
 			for (const landmarks of results.multiHandLandmarks) {
 				// Calculate bounding box from landmarks
 				let minX = Number.POSITIVE_INFINITY;
@@ -106,10 +162,38 @@ export default function WebcamStream() {
 				maxX = Math.min(canvas.width, maxX + padding);
 				maxY = Math.min(canvas.height, maxY + padding);
 
-				// Draw green bounding box
+				// Check if hand is in danger zone
+				const inZone = checkHandInDangerZone(minX, minY, maxX, maxY);
+				if (inZone) {
+					anyHandInZone = true;
+					console.log("Hand detected in danger zone!", {
+						handBox: { minX, minY, maxX, maxY },
+						dangerZone: zone,
+					});
+				}
+
+				// Draw hand bounding box - red if in danger zone, green otherwise
+				ctx.strokeStyle = inZone ? "#ff0000" : "#00ff00";
+				ctx.lineWidth = inZone ? 4 : 3;
 				ctx.strokeRect(minX, minY, maxX - minX, maxY - minY);
+
+				// Draw warning text if in danger zone
+				if (inZone) {
+					ctx.fillStyle = "#ff0000";
+					ctx.font = "bold 20px Arial";
+					ctx.fillText("⚠️ DANGER!", minX, minY - 10);
+				}
 			}
 		}
+
+		// Update state - use functional update to ensure we have latest value
+		setHandInDangerZone((prev) => {
+			// Only update if value changed to avoid unnecessary re-renders
+			if (prev !== anyHandInZone) {
+				return anyHandInZone;
+			}
+			return prev;
+		});
 	};
 
 	const startWebcam = async () => {
@@ -271,6 +355,70 @@ export default function WebcamStream() {
 		setIsStreaming(false);
 	};
 
+	// Handle mouse events for defining danger zone
+	const handleVideoMouseDown = (e: React.MouseEvent<HTMLVideoElement>) => {
+		if (!isDefiningZone || !videoRef.current) return;
+
+		const rect = videoRef.current.getBoundingClientRect();
+		const x = e.clientX - rect.left;
+		const y = e.clientY - rect.top;
+
+		// Scale coordinates to video dimensions
+		const scaleX = videoRef.current.videoWidth / rect.width;
+		const scaleY = videoRef.current.videoHeight / rect.height;
+
+		dragStartRef.current = {
+			x: x * scaleX,
+			y: y * scaleY,
+		};
+		isDraggingRef.current = true;
+	};
+
+	const handleVideoMouseMove = (e: React.MouseEvent<HTMLVideoElement>) => {
+		if (
+			!isDefiningZone ||
+			!isDraggingRef.current ||
+			!dragStartRef.current ||
+			!videoRef.current
+		)
+			return;
+
+		const rect = videoRef.current.getBoundingClientRect();
+		const x = e.clientX - rect.left;
+		const y = e.clientY - rect.top;
+
+		// Scale coordinates to video dimensions
+		const scaleX = videoRef.current.videoWidth / rect.width;
+		const scaleY = videoRef.current.videoHeight / rect.height;
+
+		const currentX = x * scaleX;
+		const currentY = y * scaleY;
+
+		// Update danger zone while dragging
+		setDangerZone({
+			x: Math.min(dragStartRef.current.x, currentX),
+			y: Math.min(dragStartRef.current.y, currentY),
+			width: Math.abs(currentX - dragStartRef.current.x),
+			height: Math.abs(currentY - dragStartRef.current.y),
+		});
+	};
+
+	const handleVideoMouseUp = () => {
+		if (!isDefiningZone) return;
+		isDraggingRef.current = false;
+		setIsDefiningZone(false);
+	};
+
+	const startDefiningZone = () => {
+		setIsDefiningZone(true);
+		setDangerZone(null);
+	};
+
+	const clearDangerZone = () => {
+		setDangerZone(null);
+		setHandInDangerZone(false);
+	};
+
 	const captureAndSendFrame = () => {
 		if (!videoRef.current || !canvasRef.current) return;
 
@@ -323,8 +471,14 @@ export default function WebcamStream() {
 					autoPlay
 					playsInline
 					muted
-					className="rounded-lg border-2 border-gray-300 bg-black"
+					className={`rounded-lg border-2 border-gray-300 bg-black ${
+						isDefiningZone ? "cursor-crosshair" : ""
+					}`}
 					style={{ display: isStreaming ? "block" : "none" }}
+					onMouseDown={handleVideoMouseDown}
+					onMouseMove={handleVideoMouseMove}
+					onMouseUp={handleVideoMouseUp}
+					onMouseLeave={handleVideoMouseUp}
 				/>
 				<canvas
 					ref={overlayCanvasRef}
@@ -347,24 +501,78 @@ export default function WebcamStream() {
 				<div className="rounded-lg bg-red-100 p-4 text-red-700">{error}</div>
 			)}
 
-			<div className="flex gap-4">
-				{!isStreaming ? (
-					<button
-						type="button"
-						onClick={startWebcam}
-						className="rounded-lg bg-blue-600 px-6 py-2 text-white hover:bg-blue-700 transition-colors"
-					>
-						Start Streaming
-					</button>
-				) : (
-					<button
-						type="button"
-						onClick={stopWebcam}
-						className="rounded-lg bg-red-600 px-6 py-2 text-white hover:bg-red-700 transition-colors"
-					>
-						Stop Streaming
-					</button>
-				)}
+			{handInDangerZone && dangerZone && (
+				<div className="w-full rounded-lg bg-red-600 p-6 text-white font-bold text-xl animate-pulse shadow-lg border-4 border-red-800">
+					<div className="flex items-center justify-center gap-2">
+						<span className="text-3xl">⚠️</span>
+						<span>WARNING: Hand detected in danger zone!</span>
+						<span className="text-3xl">⚠️</span>
+					</div>
+					{trackedItemName && (
+						<div className="text-center mt-2 text-lg">
+							Item: {trackedItemName}
+						</div>
+					)}
+				</div>
+			)}
+
+			<div className="flex flex-col gap-4 w-full max-w-2xl">
+				{/* Item Name Input */}
+				<div className="flex flex-col gap-2">
+					<label htmlFor="itemName" className="text-sm font-medium">
+						Tracked Item Name (e.g., Knife, Hot Surface, Machine):
+					</label>
+					<input
+						id="itemName"
+						type="text"
+						value={trackedItemName}
+						onChange={(e) => setTrackedItemName(e.target.value)}
+						placeholder="Enter item name..."
+						className="px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+					/>
+				</div>
+
+				{/* Control Buttons */}
+				<div className="flex gap-4 flex-wrap">
+					{!isStreaming ? (
+						<button
+							type="button"
+							onClick={startWebcam}
+							className="rounded-lg bg-blue-600 px-6 py-2 text-white hover:bg-blue-700 transition-colors"
+						>
+							Start Streaming
+						</button>
+					) : (
+						<>
+							<button
+								type="button"
+								onClick={stopWebcam}
+								className="rounded-lg bg-red-600 px-6 py-2 text-white hover:bg-red-700 transition-colors"
+							>
+								Stop Streaming
+							</button>
+							<button
+								type="button"
+								onClick={startDefiningZone}
+								disabled={isDefiningZone}
+								className="rounded-lg bg-yellow-600 px-6 py-2 text-white hover:bg-yellow-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+							>
+								{isDefiningZone
+									? "Drag on video to define zone..."
+									: "Define Danger Zone"}
+							</button>
+							{dangerZone && (
+								<button
+									type="button"
+									onClick={clearDangerZone}
+									className="rounded-lg bg-gray-600 px-6 py-2 text-white hover:bg-gray-700 transition-colors"
+								>
+									Clear Danger Zone
+								</button>
+							)}
+						</>
+					)}
+				</div>
 			</div>
 
 			{isStreaming && (
