@@ -2,13 +2,52 @@
 
 import { useEffect, useRef, useState } from "react";
 
+// Type definitions for MediaPipe Hands
+interface HandLandmark {
+	x: number;
+	y: number;
+	z?: number;
+}
+
+interface HandResults {
+	multiHandLandmarks?: HandLandmark[][];
+}
+
+interface HandsConfig {
+	locateFile?: (path: string, prefix?: string) => string;
+}
+
+interface HandsInterface {
+	close(): Promise<void>;
+	onResults(listener: (results: HandResults) => void): void;
+	initialize(): Promise<void>;
+	reset(): void;
+	send(inputs: {
+		image: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement;
+	}): Promise<void>;
+	setOptions(options: {
+		maxNumHands?: number;
+		modelComplexity?: 0 | 1;
+		minDetectionConfidence?: number;
+		minTrackingConfidence?: number;
+	}): void;
+}
+
+interface HandsConstructor {
+	new (config?: HandsConfig): HandsInterface;
+}
+
 export default function WebcamStream() {
 	const videoRef = useRef<HTMLVideoElement>(null);
 	const canvasRef = useRef<HTMLCanvasElement>(null);
+	const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
 	const [isStreaming, setIsStreaming] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const streamRef = useRef<MediaStream | null>(null);
 	const intervalRef = useRef<NodeJS.Timeout | null>(null);
+	const handsRef = useRef<HandsInterface | null>(null);
+	const animationFrameRef = useRef<number | null>(null);
+	const HandsClassRef = useRef<HandsConstructor | null>(null);
 
 	useEffect(() => {
 		return () => {
@@ -21,8 +60,57 @@ export default function WebcamStream() {
 			if (intervalRef.current) {
 				clearInterval(intervalRef.current);
 			}
+			if (animationFrameRef.current !== null) {
+				cancelAnimationFrame(animationFrameRef.current);
+			}
+			if (handsRef.current) {
+				handsRef.current.close();
+			}
 		};
 	}, []);
+
+	const drawHandBoundingBoxes = (results: HandResults) => {
+		if (!overlayCanvasRef.current || !videoRef.current) return;
+
+		const canvas = overlayCanvasRef.current;
+		const ctx = canvas.getContext("2d");
+		if (!ctx) return;
+
+		// Clear previous drawings
+		ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+		if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+			ctx.strokeStyle = "#00ff00"; // Green color
+			ctx.lineWidth = 3;
+
+			for (const landmarks of results.multiHandLandmarks) {
+				// Calculate bounding box from landmarks
+				let minX = Number.POSITIVE_INFINITY;
+				let minY = Number.POSITIVE_INFINITY;
+				let maxX = Number.NEGATIVE_INFINITY;
+				let maxY = Number.NEGATIVE_INFINITY;
+
+				for (const landmark of landmarks) {
+					const x = landmark.x * canvas.width;
+					const y = landmark.y * canvas.height;
+					minX = Math.min(minX, x);
+					minY = Math.min(minY, y);
+					maxX = Math.max(maxX, x);
+					maxY = Math.max(maxY, y);
+				}
+
+				// Add padding to the bounding box
+				const padding = 20;
+				minX = Math.max(0, minX - padding);
+				minY = Math.max(0, minY - padding);
+				maxX = Math.min(canvas.width, maxX + padding);
+				maxY = Math.min(canvas.height, maxY + padding);
+
+				// Draw green bounding box
+				ctx.strokeRect(minX, minY, maxX - minX, maxY - minY);
+			}
+		}
+	};
 
 	const startWebcam = async () => {
 		try {
@@ -33,9 +121,100 @@ export default function WebcamStream() {
 
 			streamRef.current = stream;
 
-			if (videoRef.current) {
+			if (videoRef.current && overlayCanvasRef.current) {
 				videoRef.current.srcObject = stream;
 				videoRef.current.play();
+
+				// Load MediaPipe Hands dynamically
+				const initHands = async () => {
+					try {
+						// Load MediaPipe Hands module
+						// Since it uses global exports, we need to access it after import
+						const handsModule = await import("@mediapipe/hands");
+
+						// MediaPipe exports to global, so we need to wait a bit for it to initialize
+						// Try accessing from module first, then from global
+						let Hands: HandsConstructor | null = null;
+
+						// Type-safe access to MediaPipe module
+						const moduleWithHands = handsModule as unknown as {
+							Hands?: HandsConstructor;
+						};
+						const windowWithHands = window as unknown as {
+							Hands?: HandsConstructor;
+						};
+
+						// Check if it's exported from the module
+						if (moduleWithHands.Hands) {
+							Hands = moduleWithHands.Hands;
+						} else if (windowWithHands.Hands) {
+							// Check global object
+							Hands = windowWithHands.Hands;
+						} else {
+							// Wait a bit for the module to initialize on global
+							await new Promise((resolve) => setTimeout(resolve, 100));
+							Hands = windowWithHands.Hands || moduleWithHands.Hands || null;
+						}
+
+						if (!Hands) {
+							throw new Error("Hands class not found in MediaPipe module");
+						}
+
+						HandsClassRef.current = Hands;
+
+						// Initialize MediaPipe Hands
+						const hands = new Hands({
+							locateFile: (file: string) => {
+								return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+							},
+						});
+
+						hands.setOptions({
+							maxNumHands: 2,
+							modelComplexity: 1,
+							minDetectionConfidence: 0.5,
+							minTrackingConfidence: 0.5,
+						});
+
+						hands.onResults((results: HandResults) => {
+							drawHandBoundingBoxes(results);
+						});
+
+						handsRef.current = hands;
+
+						// Process frames using requestAnimationFrame
+						const processFrame = async () => {
+							if (
+								videoRef.current &&
+								handsRef.current &&
+								!videoRef.current.paused &&
+								videoRef.current.readyState >= videoRef.current.HAVE_METADATA
+							) {
+								await handsRef.current.send({ image: videoRef.current });
+							}
+							animationFrameRef.current = requestAnimationFrame(processFrame);
+						};
+
+						// Set overlay canvas dimensions and start processing frames once video is ready
+						const videoElement = videoRef.current;
+						if (videoElement) {
+							videoElement.addEventListener("loadedmetadata", () => {
+								if (overlayCanvasRef.current && videoElement) {
+									overlayCanvasRef.current.width = videoElement.videoWidth;
+									overlayCanvasRef.current.height = videoElement.videoHeight;
+								}
+								animationFrameRef.current = requestAnimationFrame(processFrame);
+							});
+						}
+					} catch (err) {
+						console.error("Error initializing MediaPipe Hands:", err);
+						setError(
+							"Failed to initialize hand tracking. Please refresh the page.",
+						);
+					}
+				};
+
+				initHands();
 			}
 
 			setIsStreaming(true);
@@ -63,8 +242,30 @@ export default function WebcamStream() {
 			intervalRef.current = null;
 		}
 
+		if (animationFrameRef.current !== null) {
+			cancelAnimationFrame(animationFrameRef.current);
+			animationFrameRef.current = null;
+		}
+
+		if (handsRef.current) {
+			handsRef.current.close();
+			handsRef.current = null;
+		}
+
 		if (videoRef.current) {
 			videoRef.current.srcObject = null;
+		}
+
+		if (overlayCanvasRef.current) {
+			const ctx = overlayCanvasRef.current.getContext("2d");
+			if (ctx) {
+				ctx.clearRect(
+					0,
+					0,
+					overlayCanvasRef.current.width,
+					overlayCanvasRef.current.height,
+				);
+			}
 		}
 
 		setIsStreaming(false);
@@ -124,6 +325,15 @@ export default function WebcamStream() {
 					muted
 					className="rounded-lg border-2 border-gray-300 bg-black"
 					style={{ display: isStreaming ? "block" : "none" }}
+				/>
+				<canvas
+					ref={overlayCanvasRef}
+					className="absolute top-0 left-0 rounded-lg pointer-events-none"
+					style={{
+						display: isStreaming ? "block" : "none",
+						width: "100%",
+						height: "100%",
+					}}
 				/>
 				{!isStreaming && (
 					<div className="flex h-[480px] w-[640px] items-center justify-center rounded-lg border-2 border-gray-300 bg-gray-100">
